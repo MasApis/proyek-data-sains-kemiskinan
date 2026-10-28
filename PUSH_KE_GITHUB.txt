@@ -1,0 +1,58 @@
+PUSH PROJECT INI KE GITHUB - LANGKAH COPY-PASTE
+(Kamu yang push sendiri pakai akun GitHub-mu, saya tidak minta connect GitHub)
+
+LANGKAH 1 - Download dan unzip
+  Download ZIP repo ini, unzip di laptopmu.
+  Masuk ke folder hasil unzip di terminal:
+    cd <folder hasil unzip>
+
+LANGKAH 2 - Buat repo baru di GitHub (lewat browser, 1 menit)
+  1. Buka github.com, login akunmu.
+  2. Klik + (kanan atas) > New repository.
+  3. Repository name: proyek-data-sains-kemiskinan
+     (boleh ganti nama lain, tapi ingat nama yang kamu pakai di Langkah 3)
+  4. Pilih Public atau Private, terserah kelompok.
+  5. PENTING: JANGAN centang "Add a README file", "Add .gitignore",
+     atau "Choose a license". Biarkan kosong, supaya tidak bentrok
+     dengan file yang sudah ada di folder ini.
+  6. Klik Create repository. Biarkan halaman itu terbuka.
+
+LANGKAH 3 - Push dari terminal (ZIP ini SUDAH berisi commit pertama)
+  Di halaman repo baru tadi, GitHub akan menampilkan alamat repo-mu,
+  misalnya: https://github.com/MasApis/proyek-data-sains-kemiskinan.git
+  Kalau username-mu bukan MasApis, ganti bagian itu dengan username-mu.
+
+  Karena ZIP ini sudah berisi .git dan commit pertama, kamu TIDAK perlu
+  git init dan git commit lagi. Cukup 2 perintah ini, satu per satu:
+    git remote add origin https://github.com/MasApis/proyek-data-sains-kemiskinan.git
+    git push -u origin main
+
+  Catatan:
+  - Kalau perintah git remote add origin gagal karena remote sudah ada,
+    jalankan dulu: git remote remove origin
+    lalu ulangi git remote add origin di atas.
+  - Kalau GitHub minta login saat push, login lewat browser / token
+    sesuai petunjuk GitHub di layar. Jangan kirim password/token ke chat.
+  - Commit pertama di ZIP ini pakai nama MasApis dan email placeholder
+    (masapis@example.local) supaya bisa commit di mesin pembuat.
+    Itu tidak menghalangi push, repo tetap milik akun yang push.
+    Kalau kamu mau commit-nya atas email GitHub-mu sendiri, sebelum push
+    jalankan: git commit --amend --author="Nama Kamu <email GitHub kamu>" --no-edit
+    lalu push seperti biasa. Langkah ini opsional, boleh dilewati.
+
+  Kalau kamu menghapus folder .git atau mengunduh file tanpa .git,
+  baru pakai cara lengkap ini:
+    git init -b main
+    git add .
+    git commit -m "Project Data Sains: Analisis dan Prediksi Kemiskinan Provinsi + Aplikasi Streamlit + E-book Kelompok"
+    git remote add origin https://github.com/MasApis/proyek-data-sains-kemiskinan.git
+    git push -u origin main
+
+LANGKAH 4 - Cek di GitHub
+  Refresh halaman repo di browser. Harusnya muncul:
+  README.md, app.py, 2 file Excel, folder ebook/, folder notebook/.
+  Klik README.md, pastikan tampilannya rapi.
+
+SELESAI. Kirim link repo itu ke kelompokmu.
+Link contoh (ganti nama repo kalau kamu ganti):
+  https://github.com/MasApis/proyek-data-sains-kemiskinan
