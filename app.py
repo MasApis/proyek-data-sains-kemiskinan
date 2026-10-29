@@ -1,25 +1,10 @@
 """
-Aplikasi Data Sains - Analisis dan Prediksi Tingkat Kemiskinan Provinsi
-Berdasarkan Ketersediaan Sarana Kesehatan Desa/Kelurahan di Indonesia.
-
-Cara pakai (di folder yang sama dengan 2 file Excel BPS):
-    pip install streamlit pandas scikit-learn openpyxl matplotlib
-    streamlit run app.py
-
-Alur aplikasi ini, sesuai laporan Bab 1-7:
-    Dashboard            -> ringkasan + grafik utama
-    Data & Normalisasi   -> data gabungan + contoh z-score
-    Pemodelan            -> Ridge + Random Forest, evaluasi LOOCV
-    Prediksi             -> isi 4 angka sarana, keluar prediksi persen miskin
-
-Catatan penting:
-    - Fitur model HANYA 4 sarana kesehatan. Garis kemiskinan dan jumlah
-      penduduk miskin sengaja TIDAK dipakai di model, karena keduanya
-      turunan dari targetnya sendiri (risiko leakage / mencontek jawaban).
-    - Prediksi ini indikatif saja, bukan dasar anggaran. MAE Random Forest
-      sekitar 3,87 poin, jadi nilai sebenarnya bisa meleset beberapa poin.
-    - Data kemiskinan September 2025 digabung dengan sarana kesehatan 2024,
-      jadi hasilnya asosiasi, bukan sebab-akibat.
+Penebak Persen Kemiskinan Provinsi.
+Isi 4 angka fasilitas kesehatan desa, lihat tebakan persen penduduk miskin.
+Data BPS: kemiskinan September 2025 dan sarana kesehatan 2024.
+Model hanya memakai 4 angka sarana. Hasilnya cuma tebakan, bukan angka resmi.
+Semua angka ringkasan (median, rata-rata, MAE, contoh) dihitung dari data,
+bukan ditulis manual, supaya tidak basi kalau file Excel diganti.
 """
 
 import os
@@ -43,20 +28,71 @@ FILE_FASKES = "Jumlah_Desa_Kelurahan_Yang_Memiliki_Sarana_Kesehatan_Menurut_Prov
 FEATS = ["desa_rs", "desa_puskesmas", "desa_pustu", "desa_apotek"]
 TARGET = "persen_miskin"
 
+# Nama kolom versi manusia, dipakai di label dan tabel.
+LABEL = {
+    "desa_rs": "Rumah Sakit",
+    "desa_puskesmas": "Puskesmas",
+    "desa_pustu": "Puskesmas Pembantu",
+    "desa_apotek": "Apotek",
+}
 
-def load_data():
+N_TERBESAR = 8  # jumlah baris di tabel "selisih terbesar"
+ALPHA = 10  # kekuatan penalti Ridge
+NAMA_RF = "Random Forest"
+NAMA_RIDGE = "Ridge"
+NAMA_BASE = "Baseline rata-rata"
+
+
+def _pisah_baris_indonesia(mentah):
+    """Potong tabel BPS jadi (baris provinsi, baris Indonesia).
+
+    File BPS menaruh 38 provinsi lebih dulu, lalu baris "Indonesia", lalu
+    catatan kaki. Memotong tepat di nama "Indonesia" lebih tahan kalau
+    jumlah provinsi berubah, dibanding menebak "39 baris pertama".
+    """
+    provinsi = mentah["Provinsi"].astype("string").str.strip()
+    if "Indonesia" not in provinsi.tolist():
+        raise ValueError(
+            "Baris 'Indonesia' tidak ditemukan. File BPS sepertinya berubah format."
+        )
+    posisi = provinsi.tolist().index("Indonesia")
+    data = mentah.iloc[:posisi]
+    if data["Provinsi"].isna().any():
+        raise ValueError("Ada baris tanpa nama provinsi di atas baris 'Indonesia'.")
+    return data, mentah.iloc[posisi]
+
+
+def _ke_angka(nilai):
+    """Ubah satu sel BPS jadi angka. Strip berarti tidak ada, jadi 0."""
+    teks = str(nilai).strip()
+    if teks in {"–", "-", "nan"}:
+        return 0
+    return pd.to_numeric(teks, errors="raise")
+
+
+def _stempel_file():
+    """Waktu ubah kedua file Excel, dipakai sebagai kunci cache.
+
+    Kalau file diganti, cache ikut batal, jadi angka di layar tidak basi.
+    """
+    return tuple(os.path.getmtime(f) for f in (FILE_MISKIN, FILE_FASKES))
+
+
+@st.cache_data(show_spinner="Membaca file Excel BPS...")
+def load_data(stempel):
     """Baca, bersihkan, dan gabungkan 2 file Excel BPS (Bab 3 laporan).
 
-    Langkahnya sama persis dengan yang sudah diverifikasi di Colab:
-    baca sebagai teks, ambil 39 baris pertama (38 provinsi + Indonesia),
-    buang baris Indonesia, pilih September 2025 dan 4 sarana, ubah nama
-    kolom jadi snake_case, ubah teks jadi angka, lalu inner join.
+    Langkahnya sama dengan yang sudah diverifikasi di Colab:
+    baca sebagai teks, ambil baris provinsi saja, pilih September 2025 dan
+    4 sarana, ubah nama kolom jadi snake_case, ubah teks jadi angka, lalu
+    inner join. Sekalian dicek apakah total tiap sarana sama dengan baris
+    Indonesia di file asli.
     """
-    miskin = pd.read_excel(FILE_MISKIN, dtype=str).iloc[:39]
-    faskes = pd.read_excel(FILE_FASKES, dtype=str).iloc[:39]
+    mentah_miskin = pd.read_excel(FILE_MISKIN, dtype=str)
+    mentah_faskes = pd.read_excel(FILE_FASKES, dtype=str)
 
-    miskin = miskin[miskin["Provinsi"] != "Indonesia"]
-    faskes = faskes[faskes["Provinsi"] != "Indonesia"]
+    miskin, _ = _pisah_baris_indonesia(mentah_miskin)
+    faskes, total_indonesia = _pisah_baris_indonesia(mentah_faskes)
 
     miskin = miskin.rename(columns={
         "Provinsi": "provinsi",
@@ -66,13 +102,15 @@ def load_data():
     })[["provinsi", "garis_kemiskinan", "jumlah_miskin_ribu", "persen_miskin"]]
 
     prefix = "Desa/Kelurahan Yang Memiliki Sarana Kesehatan - "
-    faskes = faskes.rename(columns={
+    kolom_faskes = {
         "Provinsi": "provinsi",
         prefix + "Rumah Sakit": "desa_rs",
         prefix + "Puskesmas": "desa_puskesmas",
         prefix + "Puskesmas Pembantu": "desa_pustu",
         prefix + "Apotek": "desa_apotek",
-    })[["provinsi", "desa_rs", "desa_puskesmas", "desa_pustu", "desa_apotek"]]
+    }
+    faskes = faskes.rename(columns=kolom_faskes)
+    faskes = faskes[["provinsi", "desa_rs", "desa_puskesmas", "desa_pustu", "desa_apotek"]]
 
     miskin["provinsi"] = miskin["provinsi"].str.strip()
     faskes["provinsi"] = faskes["provinsi"].str.strip()
@@ -85,19 +123,26 @@ def load_data():
         miskin[kolom] = pd.to_numeric(miskin[kolom], errors="raise")
 
     df = miskin.merge(faskes, on="provinsi", how="inner", validate="one_to_one")
-    return df
+
+    # Baris Indonesia = jumlah seluruh provinsi menurut BPS. Cocokkan.
+    total_resmi = {
+        kolom: int(_ke_angka(total_indonesia[kolom_asli]))
+        for kolom_asli, kolom in kolom_faskes.items()
+        if kolom in FEATS
+    }
+    return df, total_resmi
 
 
 def latih_model_final(df):
-    """Latih 1 model final di semua 38 provinsi, untuk halaman Prediksi.
+    """Latih 1 model final di semua provinsi, untuk halaman Prediksi.
 
     Ini beda dengan evaluasi LOOCV di halaman Pemodelan. LOOCV itu untuk
     menguji (tiap provinsi ditahan bergiliran). Model final ini untuk
     memakai: dilatih sekali di semua data, lalu dipakai menebak input baru.
     """
-    X = df[FEATS].values
-    y = df[TARGET].values
-    ridge_final = make_pipeline(StandardScaler(), Ridge(alpha=10)).fit(X, y)
+    X = df[FEATS].to_numpy()
+    y = df[TARGET].to_numpy()
+    ridge_final = make_pipeline(StandardScaler(), Ridge(alpha=ALPHA)).fit(X, y)
     rf_final = RandomForestRegressor(
         n_estimators=200, max_depth=3, min_samples_leaf=3, random_state=42
     ).fit(X, y)
@@ -111,30 +156,77 @@ def hitung_metrik(y_asli, y_pred):
     return mae, rmse, r2
 
 
+@st.cache_data(show_spinner=False)
+def evaluasi_loocv(df):
+    """Uji 2 model + baseline dengan LOOCV, plus pengaruh tiap fasilitas.
+
+    Mengembalikan 3 tabel: metrik, selisih per provinsi, dan feature
+    importance. Hasilnya di-cache supaya tidak dihitung dua kali saat
+    dipakai di halaman Pemodelan dan Prediksi.
+    """
+    X = df[FEATS].to_numpy()
+    y = df[TARGET].to_numpy()
+    loo = LeaveOneOut()
+
+    ridge = make_pipeline(StandardScaler(), Ridge(alpha=ALPHA))
+    rf = RandomForestRegressor(
+        n_estimators=200, max_depth=3, min_samples_leaf=3, random_state=42
+    )
+    tebakan = {
+        NAMA_RIDGE: cross_val_predict(ridge, X, y, cv=loo),
+        NAMA_RF: cross_val_predict(rf, X, y, cv=loo),
+        NAMA_BASE: np.array([y[latih].mean() for latih, _uji in loo.split(X)]),
+    }
+
+    metrik = []
+    for nama, pred in tebakan.items():
+        mae, rmse, r2 = hitung_metrik(y, pred)
+        metrik.append({"Model": nama, "MAE": mae, "RMSE": rmse, "R2": r2})
+    metrik = pd.DataFrame(metrik)
+
+    selisih = pd.DataFrame({
+        "provinsi": df["provinsi"].to_numpy(),
+        "aktual": y,
+        "prediksi": tebakan[NAMA_RF],
+    })
+    selisih["selisih"] = (selisih["aktual"] - selisih["prediksi"]).abs()
+
+    _ridge_final, rf_final = latih_model_final(df)
+    pengaruh = pd.DataFrame({
+        "Fasilitas": [LABEL[kolom] for kolom in FEATS],
+        "Pengaruh": rf_final.feature_importances_,
+    }).sort_values("Pengaruh", ascending=False, ignore_index=True)
+
+    return metrik, selisih, pengaruh
+
+
 # ---------------------------------------------------------------------------
 # Tampilan utama
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="Prediksi Kemiskinan Provinsi", layout="wide")
-st.title("Analisis dan Prediksi Tingkat Kemiskinan Provinsi")
+st.set_page_config(page_title="Penebak Persen Kemiskinan", layout="wide")
+st.title("Penebak Persen Kemiskinan")
 st.write(
-    "Berdasarkan ketersediaan sarana kesehatan desa/kelurahan. "
-    "Data: BPS, kemiskinan September 2025 dan sarana kesehatan 2024, 38 provinsi."
+    "Isi 4 angka fasilitas kesehatan desa, lihat tebakan persen penduduk miskin. "
+    "Data BPS: kemiskinan September 2025 dan sarana kesehatan 2024."
 )
 
 # Kalau file Excel belum ada di folder yang sama, beri tahu dengan jelas,
 # jangan biarkan aplikasi crash tanpa penjelasan.
 if not (os.path.exists(FILE_MISKIN) and os.path.exists(FILE_FASKES)):
     st.error(
-        "File Excel belum ditemukan di folder yang sama dengan app.py. "
-        "Salin 2 file ini ke folder yang sama dengan app.py, lalu jalankan ulang:\n"
-        f"- {FILE_MISKIN}\n"
-        f"- {FILE_FASKES}"
+        "2 file Excel belum ditemukan di folder ini. "
+        "Salin kedua file Excel BPS ke folder yang sama dengan app.py, lalu jalankan ulang."
     )
     st.stop()
 
-df = load_data()
-X = df[FEATS].values
-y = df[TARGET].values
+df, total_resmi = load_data(_stempel_file())
+X = df[FEATS].to_numpy()
+y = df[TARGET].to_numpy()
+
+provinsi_termiskin = df.loc[df[TARGET].idxmax()]
+provinsi_terkaya = df.loc[df[TARGET].idxmin()]
+rata_rata = float(df[TARGET].mean())
+nilai_tengah = float(df[TARGET].median())
 
 # Menu di kiri, persis 4 halaman di Bab 7.4 laporan.
 halaman = st.sidebar.radio(
@@ -147,34 +239,45 @@ halaman = st.sidebar.radio(
 # ---------------------------------------------------------------------------
 if halaman == "Dashboard":
     st.header("Dashboard")
-    st.write(
-        "Ringkasan cepat: kemiskinan itu timpang antarwilayah, "
-        "bukan sekadar rata-rata nasional."
-    )
+    st.write(f"Gambaran cepat {len(df)} provinsi.")
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Provinsi", "38")
-    col2.metric("Median kemiskinan", f"{df[TARGET].median():.3f}%")
-    col3.metric("Terendah (Bali)", f"{df[TARGET].min():.2f}%")
-    col4.metric("Tertinggi (Papua Tengah)", f"{df[TARGET].max():.2f}%")
+    col1.metric("Provinsi", len(df))
+    col2.metric("Nilai tengah", f"{nilai_tengah:.2f}%")
+    col3.metric(f"Terendah: {provinsi_terkaya['provinsi']}", f"{provinsi_terkaya[TARGET]:.2f}%")
+    col4.metric(f"Tertinggi: {provinsi_termiskin['provinsi']}", f"{provinsi_termiskin[TARGET]:.2f}%")
 
-    st.subheader("Top 10 provinsi dengan kemiskinan tertinggi")
+    st.subheader("10 provinsi termiskin")
     top10 = df.nlargest(10, TARGET).sort_values(TARGET)
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.barh(top10["provinsi"], top10[TARGET])
     ax.set_xlabel("Persen miskin (%)")
+    ax.set_title(f"10 provinsi termiskin ({top10[TARGET].min():.2f}–{top10[TARGET].max():.2f}%)")
     st.pyplot(fig)
+    plt.close(fig)
 
     st.subheader("Distribusi persen miskin")
-    st.write(
-        "Rata-rata (10,27%) lebih tinggi dari median (9,345%). "
-        "Artinya distribusi miring kanan, ditarik oleh Papua."
+    arah = "lebih tinggi" if rata_rata > nilai_tengah else "lebih rendah"
+    pesan = (
+        f"Rata-rata {rata_rata:.2f}% {arah} dari nilai tengah {nilai_tengah:.2f}%."
     )
+    if rata_rata > nilai_tengah:
+        pesan += (
+            " Artinya ada beberapa provinsi yang kemiskinannya jauh di atas "
+            "kebanyakan, sehingga rata-rata ikut tertarik naik."
+        )
+    else:
+        pesan += " Artinya sebarannya relatif mendekati simetris."
+    st.write(pesan)
+
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.hist(df[TARGET], bins=10)
-    ax.axvline(df[TARGET].median(), linestyle="--", label="Median 9,345%")
-    ax.axvline(df[TARGET].mean(), linestyle=":", label="Mean 10,27%")
+    ax.axvline(nilai_tengah, linestyle="--", label=f"Nilai tengah {nilai_tengah:.2f}%")
+    ax.axvline(rata_rata, linestyle=":", label=f"Rata-rata {rata_rata:.2f}%")
+    ax.set_xlabel("Persen miskin (%)")
+    ax.set_ylabel("Jumlah provinsi")
     ax.legend()
     st.pyplot(fig)
+    plt.close(fig)
 
 # ---------------------------------------------------------------------------
 # Halaman 2: Data & Normalisasi
@@ -182,38 +285,50 @@ if halaman == "Dashboard":
 elif halaman == "Data & Normalisasi":
     st.header("Data & Normalisasi")
     st.write(
-        "Data gabungan 38 provinsi x 8 kolom: 1 kunci provinsi, "
-        "6 fitur asli, dan 1 target persen_miskin. Nilai kosong: 0."
+        f"Tabel gabungan {len(df)} provinsi. Kolom persen_miskin adalah angka yang ditebak model. "
+        "Tanda strip di file BPS (artinya sarana tidak tersedia) sudah diubah jadi 0."
     )
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df)
 
-    st.subheader("Statistik deskriptif")
+    st.subheader("Ringkasan tiap kolom")
+    st.write("Rata-rata, terendah, tertinggi, dan nilai tengah tiap kolom.")
     st.dataframe(df.describe().T[["mean", "std", "min", "25%", "50%", "75%", "max"]])
 
-    st.subheader("Contoh normalisasi (z-score)")
+    st.subheader("Contoh penyamaan skala")
     st.write(
-        "Rumus z-score: (nilai - rata-rata) / simpangan baku. "
-        "Tujuannya menyamakan skala, supaya variabel yang angkanya besar "
-        "(misalnya apotek sampai 2.903) tidak mendominasi model linear. "
-        "Di halaman Pemodelan, Ridge memakai scaler di dalam pipeline, "
-        "dan scaler itu hanya dipasang di data latih tiap fold, "
-        "supaya data uji tidak bocor ke proses normalisasi. "
-        "Tabel di bawah ini hanya contoh tampilan z-score dari semua data."
+        "Supaya angka besar dan kecil bisa dibandingkan, tiap angka diubah "
+        "jadi selisihnya dari rata-rata. Tabel di bawah ini cuma contoh tampilan, "
+        "bukan cara model menghitung di dalam."
     )
     scaler_tampil = StandardScaler()
     df_z = df.copy()
     df_z[FEATS] = scaler_tampil.fit_transform(df[FEATS])
-    st.dataframe(df_z[["provinsi"] + FEATS], use_container_width=True)
+    st.dataframe(df_z[["provinsi"] + FEATS])
 
-    st.subheader("Validasi cleaning")
-    st.write(
-        f"Total desa ber-RS: {int(df['desa_rs'].sum())} | "
-        f"Puskesmas: {int(df['desa_puskesmas'].sum())} | "
-        f"Pustu: {int(df['desa_pustu'].sum())} | "
-        f"Apotek: {int(df['desa_apotek'].sum())}. "
-        "Total ini sama dengan baris Indonesia di file asli, "
-        "jadi cleaning tidak menghilangkan data."
+    st.subheader("Cek total data")
+    total_gabungan = {kolom: int(df[kolom].sum()) for kolom in FEATS}
+    rincian = " | ".join(
+        f"{LABEL[kolom]}: {total_gabungan[kolom]:,}".replace(",", ".")
+        for kolom in FEATS
     )
+    st.write(f"Total desa menurut tabel gabungan: {rincian}.")
+
+    selisih_total = {
+        kolom: total_gabungan[kolom] - total_resmi[kolom] for kolom in FEATS
+    }
+    if all(nilai == 0 for nilai in selisih_total.values()):
+        st.success(
+            "Total tiap sarana sama dengan baris Indonesia di file asli, "
+            "jadi tidak ada data yang hilang saat digabung."
+        )
+    else:
+        beda = ", ".join(
+            f"{LABEL[kolom]} {selisih_total[kolom]:+d}" for kolom in FEATS
+        )
+        st.warning(
+            f"Total tabel gabungan beda dengan baris Indonesia di file asli ({beda}). "
+            "Ada baris provinsi yang tidak ikut tergabung."
+        )
 
 # ---------------------------------------------------------------------------
 # Halaman 3: Pemodelan
@@ -221,86 +336,66 @@ elif halaman == "Data & Normalisasi":
 elif halaman == "Pemodelan":
     st.header("Pemodelan")
     st.write(
-        "Dua model: Ridge Regression dan Random Forest Regressor, "
-        "dievaluasi dengan LOOCV (Leave-One-Out Cross-Validation). "
-        "LOOCV artinya: tahan 1 provinsi jadi uji, latih di 37 sisanya, "
-        "ulangi 38 kali. Cara ini dipilih karena data hanya 38 provinsi."
+        "2 model diuji dengan cara bergilir: 1 provinsi disembunyikan jadi soal, "
+        f"{len(df) - 1} provinsi sisanya dipakai belajar, diulang {len(df)} kali. "
+        "Cara ini disebut LOOCV."
     )
     st.write(
-        "Fitur model hanya 4 sarana kesehatan. Garis kemiskinan dan jumlah "
-        "penduduk miskin tidak dipakai di model, karena turunan dari target."
+        "Model hanya memakai 4 angka sarana kesehatan. "
+        "Garis kemiskinan dan jumlah penduduk miskin tidak dipakai, "
+        "karena keduanya sudah turunan dari angka yang ditebak."
     )
 
-    if st.button("Hitung evaluasi LOOCV"):
-        with st.spinner("Menghitung 38 fold LOOCV, tunggu sebentar..."):
-            loo = LeaveOneOut()
-            ridge = make_pipeline(StandardScaler(), Ridge(alpha=10))
-            pred_ridge = cross_val_predict(ridge, X, y, cv=loo)
+    if st.button("Hitung hasil uji (LOOCV)"):
+        with st.spinner("Menghitung, tunggu sebentar..."):
+            metrik, selisih, pengaruh = evaluasi_loocv(df)
+            st.dataframe(metrik.round(4))
 
-            rf = RandomForestRegressor(
-                n_estimators=200, max_depth=3, min_samples_leaf=3, random_state=42
-            )
-            pred_rf = cross_val_predict(rf, X, y, cv=loo)
-
-            pred_base = []
-            for latih, _uji in loo.split(X):
-                pred_base.append(y[latih].mean())
-            pred_base = np.array(pred_base)
-
-            hasil = []
-            for nama, pred in [
-                ("Ridge", pred_ridge),
-                ("Random Forest", pred_rf),
-                ("Baseline rata-rata", pred_base),
-            ]:
-                mae, rmse, r2 = hitung_metrik(y, pred)
-                hasil.append({"Model": nama, "MAE": round(mae, 4),
-                              "RMSE": round(rmse, 4), "R2": round(r2, 4)})
-            st.dataframe(pd.DataFrame(hasil), use_container_width=True)
+            terbaik = metrik.loc[metrik["MAE"].idxmin()]
             st.write(
-                "Cara baca: MAE dan RMSE makin kecil makin baik, dalam poin persen. "
-                "R2 = 1 sempurna, 0 sama dengan menebak rata-rata, "
-                "negatif berarti lebih buruk dari rata-rata. "
-                "Random Forest adalah yang terbaik, Ridge kalah dari baseline."
+                f"MAE terkecil: {terbaik['Model']} ({terbaik['MAE']:.2f} poin persen). "
+                "MAE adalah rata-rata selisih tebakan, jadi semakin kecil semakin bagus."
             )
 
-            # Tabel kesalahan terbesar + grafik aktual vs prediksi
-            err = pd.DataFrame({
-                "provinsi": df["provinsi"].values,
-                "aktual": y,
-                "prediksi_rf": pred_rf,
-            })
-            err["galat"] = (err["aktual"] - err["prediksi_rf"]).abs()
-            st.subheader("8 kesalahan terbesar (Random Forest)")
+            mae_ridge = float(metrik.loc[metrik["Model"] == NAMA_RIDGE, "MAE"].iloc[0])
+            mae_base = float(metrik.loc[metrik["Model"] == NAMA_BASE, "MAE"].iloc[0])
+            if mae_ridge >= mae_base:
+                st.info(
+                    "Catatan jujur: Ridge belum mengalahkan baseline rata-rata. "
+                    "Artinya 4 angka sarana ini belum punya pola garis lurus yang jelas "
+                    "dengan kemiskinan. Yang menolong justru cara Random Forest "
+                    "memotong data jadi kelompok."
+                )
+
+            st.subheader(f"{N_TERBESAR} selisih terbesar ({NAMA_RF})")
             st.dataframe(
-                err.sort_values("galat", ascending=False).head(8).round(2),
-                use_container_width=True,
+                selisih.sort_values("selisih", ascending=False).head(N_TERBESAR).round(2)
             )
 
+            batas_bawah = float(min(y.min(), selisih["prediksi"].min())) - 2
+            batas_atas = float(max(y.max(), selisih["prediksi"].max())) + 2
             fig, ax = plt.subplots(figsize=(8, 5))
-            ax.scatter(y, pred_rf)
-            ax.plot([0, 30], [0, 30], linestyle="--")
+            ax.scatter(y, selisih["prediksi"])
+            ax.plot([batas_bawah, batas_atas], [batas_bawah, batas_atas], linestyle="--")
+            ax.set_xlim(batas_bawah, batas_atas)
+            ax.set_ylim(batas_bawah, batas_atas)
             ax.set_xlabel("Aktual (%)")
-            ax.set_ylabel("Prediksi Random Forest (%)")
-            ax.set_title("Aktual vs Prediksi (garis putus-putus = prediksi sempurna)")
+            ax.set_ylabel(f"Prediksi {NAMA_RF} (%)")
+            ax.set_title("Asli vs Tebakan")
             st.pyplot(fig)
+            plt.close(fig)
 
-            st.subheader("Feature importance (Random Forest, latih di semua data)")
-            _ridge_final, rf_final = latih_model_final(df)
-            imp = sorted(
-                zip(FEATS, rf_final.feature_importances_), key=lambda t: -t[1]
-            )
-            st.dataframe(
-                pd.DataFrame(imp, columns=["Variabel", "Importance"]).round(4),
-                use_container_width=True,
-            )
+            st.subheader("Fasilitas mana yang paling berpengaruh?")
+            st.dataframe(pengaruh.round(4))
+            teratas = pengaruh.iloc[0]
             st.write(
-                "Apotek paling dominan (sekitar 0,75). Hati-hati: ini bukan bukti "
-                "apotek menyebabkan kemiskinan turun. Kemungkinan besar apotek "
-                "hanya proksi ukuran provinsi (Jawa vs Papua)."
+                f"{teratas['Fasilitas']} paling besar pengaruhnya "
+                f"({teratas['Pengaruh']:.1%} dari total). Ini bukan bukti "
+                f"{teratas['Fasilitas'].lower()} menyebabkan kemiskinan turun. "
+                "Bisa jadi karena provinsi besar memang punya banyak sarana."
             )
     else:
-        st.info("Klik tombol di atas untuk menghitung evaluasi LOOCV.")
+        st.info("Klik tombol di atas untuk menghitung hasil ujinya.")
 
 # ---------------------------------------------------------------------------
 # Halaman 4: Prediksi
@@ -308,43 +403,62 @@ elif halaman == "Pemodelan":
 else:
     st.header("Prediksi")
     st.write(
-        "Isi 4 angka sarana kesehatan, lalu klik Prediksi. "
-        "Model yang dipakai untuk prediksi utama adalah Random Forest, "
-        "karena MAE-nya paling kecil di evaluasi LOOCV."
+        "Isi 4 angka di bawah, lalu klik Prediksi. "
+        f"Hasil utama memakai {NAMA_RF}, karena selisih rata-ratanya paling kecil."
     )
 
+    ridge_final, rf_final = latih_model_final(df)
+
     # Nilai awal = median tiap variabel (provinsi tipikal).
-    rs = st.number_input("Desa/kelurahan ber-Rumah Sakit", min_value=9, max_value=346, value=42)
-    puskesmas = st.number_input("Desa/kelurahan ber-Puskesmas", min_value=52, max_value=1110, value=208)
-    pustu = st.number_input("Desa/kelurahan ber-Puskesmas Pembantu", min_value=147, max_value=2218, value=442)
-    apotek = st.number_input("Desa/kelurahan ber-Apotek", min_value=8, max_value=2903, value=262)
+    isian = {}
+    for kolom in FEATS:
+        isian[kolom] = st.number_input(
+            f"Jumlah desa yang punya {LABEL[kolom]}",
+            min_value=int(df[kolom].min()),
+            max_value=int(df[kolom].max()),
+            value=int(round(df[kolom].median())),
+            step=1,
+        )
 
     st.write(
-        "Batas input di atas adalah min-max data asli. "
-        "Random Forest tidak bisa menebak dengan baik di luar rentang "
-        "yang pernah dilihatnya, jadi jangan isi jauh di luar batas itu."
+        "Batas isian mengikuti data asli di atas. "
+        "Di luar batas itu, tebakan jadi kurang bisa dipercaya."
     )
 
     if st.button("Prediksi"):
-        _ridge_final, rf_final = latih_model_final(df)
         # Urutan input harus sama persis dengan FEATS.
-        data_baru = [[rs, puskesmas, pustu, apotek]]
+        data_baru = [[isian[kolom] for kolom in FEATS]]
         p_rf = float(rf_final.predict(data_baru)[0])
-        p_ridge = float(_ridge_final.predict(data_baru)[0])
+        p_ridge = float(ridge_final.predict(data_baru)[0])
 
-        st.success(f"Prediksi Random Forest: {p_rf:.2f}%")
-        st.write(f"Prediksi Ridge (pembanding): {p_ridge:.2f}%")
+        st.success(f"Prediksi {NAMA_RF}: {p_rf:.2f}%")
+        st.write(f"Prediksi {NAMA_RIDGE} (pembanding): {p_ridge:.2f}%")
+
+        with st.spinner("Mengecek rata-rata melesetnya..."):
+            metrik, _selisih, _pengaruh = evaluasi_loocv(df)
+        mae_rf = float(metrik.loc[metrik["Model"] == NAMA_RF, "MAE"].iloc[0])
         st.warning(
-            "Prediksi ini indikatif saja, bukan dasar anggaran. "
-            "MAE Random Forest sekitar 3,87 poin, jadi nilai sebenarnya "
-            "bisa meleset beberapa poin dari angka di atas. "
-            "Hasil ini asosiasi, bukan sebab-akibat."
+            f"Ini cuma tebakan. Saat diuji bergilir, tebakan {NAMA_RF} rata-rata "
+            f"meleset {mae_rf:.1f} poin, jadi jangan dipakai sendirian untuk bagi anggaran."
         )
 
     st.subheader("Contoh cepat untuk demo")
+    isian_tengah = [[int(round(df[kolom].median())) for kolom in FEATS]]
+    p_tengah = float(rf_final.predict(isian_tengah)[0])
     st.write(
-        "- Nilai median di atas: prediksi sekitar 9-10% (provinsi tipikal).\n"
-        "- Papua Tengah (RS 14, Puskesmas 98, Pustu 148, Apotek 45): "
-        "aslinya 29,45%, tapi model kemungkinan hanya memprediksi sekitar 17%. "
-        "Ini contoh keterbatasan: model meremehkan provinsi ekstrem."
+        f"- Isian median di atas (provinsi tipikal): tebakan sekitar **{p_tengah:.2f}%**. "
+        "Ini tebakan untuk kombinasi angka tengah, bukan persentase rata-rata nasional."
+    )
+
+    p_ekstrem = float(rf_final.predict([provinsi_termiskin[FEATS].to_numpy()])[0])
+    angka_ekstrem = " | ".join(
+        f"{LABEL[kolom].replace('Puskesmas Pembantu', 'Pustu')} {provinsi_termiskin[kolom]}"
+        for kolom in FEATS
+    ).replace(" | ", ", ")
+    arah = "meremehkan" if p_ekstrem < provinsi_termiskin[TARGET] else "melebih-lebihkan"
+    st.write(
+        f"- {provinsi_termiskin['provinsi']} ({angka_ekstrem}): aslinya "
+        f"{provinsi_termiskin[TARGET]:.2f}%, model menebak {p_ekstrem:.2f}%. "
+        f"Selisih {abs(provinsi_termiskin[TARGET] - p_ekstrem):.2f} poin: "
+        f"model {arah} provinsi ekstrem."
     )
